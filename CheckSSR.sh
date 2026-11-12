@@ -55,6 +55,11 @@
 # Enable strict mode
 set -euo pipefail
 
+# launchd and cron start jobs with a minimal PATH that leaves out Homebrew's folders, which is
+# where msmtp and python3 usually live. Add them at the end so system tools still win.
+PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin"
+export PATH
+
 # Setup logging
 SCRIPT_NAME=$(basename "$0")
 LOG_DIR="${HOME}/Library/Logs/CheckSSR"
@@ -62,6 +67,10 @@ LOG_FILE="${LOG_DIR}/checkssr_$(date +%Y%m%d).log"
 
 # Create log directory if it doesn't exist
 mkdir -p "${LOG_DIR}"
+
+# Remember where this run's lines start in the log (used in the failure email)
+RUN_LOG_START=$(wc -l < "${LOG_FILE}" 2>/dev/null || echo 0)
+FAILURE_MAILED=0
 
 # Function to log messages (to the screen on stderr, and to the log file)
 log() {
@@ -87,6 +96,23 @@ send_mail() {
     else
         printf '%s\n' "${body}" | mail -s "${subject}" "${MAILTO}"
     fi
+}
+
+# Runs whenever the script ends. If it ended with an error during an unattended run, email
+# the details so a failure is never silent, then clean up the temporary files.
+on_exit() {
+    local rc=$?
+    if [[ ${rc} -ne 0 && "${PRINT_ONLY}" -eq 0 && "${FAILURE_MAILED}" -eq 0 \
+          && -n "${MAILTO}" && "${MAILTO}" != "your.email@example.com" ]]; then
+        FAILURE_MAILED=1
+        send_mail "SSR Check Failed" "CheckSSR failed on $(date '+%Y-%m-%d at %H:%M').
+
+What the script logged:
+$(tail -n +"$((RUN_LOG_START + 1))" "${LOG_FILE}" 2>/dev/null | tail -n 15)" || true
+    fi
+    log "INFO" "Cleaning up temporary files"
+    rm -rf "${TEMPDIR}"
+    log "INFO" "Script completed"
 }
 
 # Print the date N days before a YYYYMMDD date (works with both BSD/macOS and GNU date)
@@ -122,12 +148,11 @@ CONFIG_DIR="${HOME}/.config/CheckSSR"
 CONFIG_FILE="${CONFIG_DIR}/config.sh"
 
 # Default configuration values
-WRKDIR="${HOME}/Documents/CheckSSR"  # where the default positions file lives
 MAILTO=""                            # email to send notifications to
 MARKETS="NASDAQ NYSE"                # which lists to check: NASDAQ and/or NYSE
 TOPN=10                              # most recently listed stocks to show per market
 SENDSTYLE=0                          # no longer used (attachments were removed)
-STOCKS=""                            # positions file (defaults to ${WRKDIR}/positions.txt)
+STOCKS=""                            # positions file (defaults to ${CONFIG_DIR}/positions.txt)
 
 # Load configuration if it exists
 if [[ -f "${CONFIG_FILE}" ]]; then
@@ -145,8 +170,10 @@ else
 # Email address to receive notifications
 MAILTO="your.email@example.com"
 
-# Path to your stock positions file (one ticker per line, used for every market)
-STOCKS="${HOME}/Documents/CheckSSR/positions.txt"
+# Path to your stock positions file (one ticker per line, used for every market).
+# Keep it outside Documents and Desktop: iCloud can manage those folders, and scheduled
+# (launchd) runs may then be unable to read the file.
+STOCKS="${CONFIG_DIR}/positions.txt"
 
 # Which SSR lists to check: NASDAQ, NYSE or both
 MARKETS="NASDAQ NYSE"
@@ -161,7 +188,7 @@ fi
 # Command line options override the configuration file
 [[ -n "${OPT_MARKETS}" ]] && MARKETS="${OPT_MARKETS}"
 [[ -n "${OPT_TOP}" ]] && TOPN="${OPT_TOP}"
-STOCKS="${STOCKS:-${WRKDIR}/positions.txt}"
+STOCKS="${STOCKS:-${CONFIG_DIR}/positions.txt}"
 
 # Validate configuration
 if [[ "${PRINT_ONLY}" -eq 0 ]] && [[ -z "${MAILTO}" || "${MAILTO}" == "your.email@example.com" ]]; then
@@ -222,7 +249,7 @@ setup_temp_files() {
     HITS_PATH="${TEMPDIR}/hits.tsv"         # rows that match your positions
 
     # Setup trap to remove temporary files on exit
-    trap 'log "INFO" "Cleaning up temporary files"; rm -rf "${TEMPDIR}"; log "INFO" "Script completed"' EXIT
+    trap on_exit EXIT
     log "INFO" "Temporary files set up in ${TEMPDIR}"
 }
 
@@ -264,6 +291,15 @@ preflight_check() {
             ;;
     esac
 
+    # Documents and Desktop can be managed by iCloud, and background jobs (launchd) cannot
+    # always read files there ("Resource deadlock avoided"), which makes scheduled runs fail.
+    case "${STOCKS}" in
+        "${HOME}/Documents/"*|"${HOME}/Desktop/"*)
+            log "WARN" "The positions file is in Documents or Desktop, which iCloud may manage."
+            log "WARN" "Scheduled runs can fail to read it. Consider moving it to ${CONFIG_DIR}/positions.txt"
+            ;;
+    esac
+
     # Check for ticker list
     if [[ ! -f "${STOCKS}" ]]; then
         log "ERROR" "Stock positions file not found: ${STOCKS}"
@@ -279,6 +315,12 @@ preflight_check() {
 # BRK.B
 EOL
         log "ERROR" "Please edit ${STOCKS} with your positions and run again"
+        exit 1
+    fi
+
+    # Make sure the file can actually be read, so a read error is not reported as "no tickers"
+    if ! cat "${STOCKS}" > /dev/null 2> "${TEMPDIR}/read_error.txt"; then
+        log "ERROR" "Cannot read the positions file ${STOCKS}: $(cat "${TEMPDIR}/read_error.txt")"
         exit 1
     fi
 
@@ -425,6 +467,7 @@ fetch_markets() {
     if [[ "${ok}" -eq 0 ]]; then
         log "ERROR" "No SSR list could be retrieved"
         if [[ "${PRINT_ONLY}" -eq 0 ]]; then
+            FAILURE_MAILED=1
             send_mail "SSR Check Failed" "Could not retrieve any SSR list for ${TODAY}:
 ${FAILED_NOTES}" || true
         fi

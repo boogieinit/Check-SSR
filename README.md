@@ -47,7 +47,7 @@ The installer is safe to run again. It:
 
 - installs `CheckSSR.sh` as `~/bin/checkssr` (make sure `~/bin` is on your PATH),
 - creates a config file at `~/.config/CheckSSR/config.sh`,
-- creates a positions file at `~/Documents/CheckSSR/positions.txt` (examples only, commented out),
+- creates a positions file at `~/.config/CheckSSR/positions.txt` (examples only, commented out). It deliberately lives next to the config and not in Documents or Desktop: iCloud can manage those folders, and scheduled runs may then be unable to read the file,
 - optionally schedules a weekday run with launchd (macOS) at 8:40am Central, just after the open.
 
 ## Set up

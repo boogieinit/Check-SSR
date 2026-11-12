@@ -44,7 +44,9 @@ SOURCE_SCRIPT="${SCRIPT_DIR}/$(basename "${SOURCE_SCRIPT_RELATIVE}")"
 # Installation directories
 INSTALL_BIN_DIR="${HOME}/bin"
 CONFIG_DIR="${HOME}/.config/CheckSSR"
-DATA_DIR="${HOME}/Documents/CheckSSR"
+# The positions file lives next to the config, not in Documents: iCloud can manage Documents
+# and Desktop, and scheduled (launchd) runs may then be unable to read a file kept there.
+DATA_DIR="${CONFIG_DIR}"
 LOG_DIR="${HOME}/Library/Logs/CheckSSR"
 LAUNCHD_DIR="${HOME}/Library/LaunchAgents"
 LAUNCHD_FILE="com.user.checkssr.plist"
