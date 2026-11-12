@@ -69,6 +69,21 @@ checkssr [options]
 
 `--date` is handy for checking how a past day looked. Config settings (all optional except `MAILTO` and `STOCKS`): `MARKETS="NASDAQ NYSE"`, `TOPN=10`.
 
+## Uninstall
+
+```
+./install.sh --uninstall
+```
+
+This stops and deletes the scheduled job and removes the `checkssr` program (if `~/bin/checkssr` is a link, only the link goes, never the file it points to). It then asks whether to delete your settings (including your email address), your positions list and the logs. They are kept unless you say yes. At the end it checks that the job is no longer loaded and tells you so. It is safe to run again.
+
+| Option | Effect |
+|--------|--------|
+| `--purge` | Also delete the settings, positions list and logs, without asking |
+| `-y`, `--yes` | No confirmation prompts. Data is still kept unless `--purge` is also given |
+
+It only deletes files CheckSSR created, and removes a folder only if nothing else is left in it. It also finds data left by older versions (`~/Documents/CheckSSR`, `~/.config/check-ssr`). It does not touch what you set up yourself: `~/.msmtprc`, any Keychain password, Homebrew packages (msmtp, Python), the `~/bin` folder, or this download folder.
+
 ## How the two lists differ
 
 | | NASDAQ | NYSE (NYSE, NYSE American, NYSE Arca) |

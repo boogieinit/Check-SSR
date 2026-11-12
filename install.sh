@@ -12,6 +12,7 @@
 # - Creates sample positions file
 # - Sets up logging
 # - Can configure launchd for scheduled execution (optional)
+# - Can remove everything again: ./install.sh --uninstall   (see ./install.sh --help)
 #
 
 # Enable strict mode
@@ -596,8 +597,226 @@ print_usage_instructions() {
     fi
     
     echo
+    echo "6. To remove CheckSSR again (including the scheduled job), run:"
+    echo "   ${SCRIPT_DIR}/install.sh --uninstall"
+    echo
     echo "Enjoy monitoring the NASDAQ and NYSE SSR lists!"
     echo
+}
+
+############################################
+# Uninstall (./install.sh --uninstall)
+############################################
+
+usage() {
+    cat << EOL
+Usage: ./install.sh [option]
+
+  (no option)    Install CheckSSR.
+  --uninstall    Remove CheckSSR: the scheduled job and the installed program.
+                 You are then asked whether to delete your settings, positions
+                 list and logs as well. They are kept unless you say yes.
+  --purge        With --uninstall: delete the settings, positions list and logs
+                 too, without asking.
+  -y, --yes      With --uninstall: do not ask for confirmation. Settings, positions
+                 and logs are still kept unless --purge is also given.
+  -h, --help     Show this help.
+EOL
+}
+
+# Is the scheduled job loaded in launchd?
+job_is_loaded() {
+    local jobs
+    command -v launchctl &> /dev/null || return 1
+    jobs="$(launchctl list 2>/dev/null || true)"
+    awk '$3 == "com.user.checkssr" { found = 1 } END { exit !found }' <<< "$jobs"
+}
+
+# What is at ~/bin/checkssr? link, copy (a CheckSSR script), foreign (something else) or none
+program_kind() {
+    local p="${INSTALL_BIN_DIR}/checkssr"
+    if [[ -L "$p" ]]; then
+        echo "link"
+    elif [[ -f "$p" ]]; then
+        if grep -q 'CheckSSR' "$p" 2>/dev/null; then echo "copy"; else echo "foreign"; fi
+    else
+        echo "none"
+    fi
+}
+
+# Delete the files CheckSSR creates inside a folder, and nothing else
+remove_known_files() {
+    local dir="$1" f
+    shopt -s nullglob
+    for f in "$dir"/config.sh "$dir"/positions.txt "$dir"/checkssr_*.log "$dir"/.DS_Store; do
+        rm -f "$f" || true
+    done
+    for f in "$dir"/ssr_check.*; do          # temporary folders left by older versions
+        if [[ -d "$f" ]]; then rm -rf "$f" || true; fi
+    done
+    shopt -u nullglob
+}
+
+ask_yes_no() {
+    local reply=""
+    read -p "$1 (y/n) " -n 1 -r reply || true
+    echo
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+uninstall() {
+    echo -e "${BLUE}"
+    echo "==============================================="
+    echo "  ${SCRIPT_NAME} Uninstaller v${SCRIPT_VERSION}"
+    echo "==============================================="
+    echo -e "${NC}"
+
+    local plist="${LAUNCHD_DIR}/${LAUNCHD_FILE}"
+    local program="${INSTALL_BIN_DIR}/checkssr"
+    local have_plist=false loaded=false kind d existing seen
+    local data_dirs=() leftovers=() removed=() kept=() failed=()
+
+    # --- What is there? -------------------------------------------------------------
+    if [[ -f "$plist" ]]; then have_plist=true; fi
+    if job_is_loaded; then loaded=true; fi
+    kind="$(program_kind)"
+
+    # Folders that hold your data: current locations first, then ones older versions used
+    for d in "${CONFIG_DIR}" "${LOG_DIR}" "${HOME}/Documents/CheckSSR" "${HOME}/.config/check-ssr" "${HOME}/.config/Check-SSR"; do
+        [[ -d "$d" ]] || continue
+        seen=false
+        for existing in ${data_dirs[@]+"${data_dirs[@]}"}; do
+            if [[ "$existing" -ef "$d" ]]; then seen=true; fi
+        done
+        if [[ "$seen" == false ]]; then data_dirs+=("$d"); fi
+    done
+    shopt -s nullglob
+    leftovers=("${HOME}"/.checkssr_installer_temp.*)
+    shopt -u nullglob
+
+    if [[ "$have_plist" == false && "$loaded" == false && "$kind" == "none" \
+          && ${#data_dirs[@]} -eq 0 && ${#leftovers[@]} -eq 0 ]]; then
+        print_info "Nothing to uninstall: CheckSSR does not appear to be installed."
+        return 0
+    fi
+
+    echo "Found:"
+    if [[ "$have_plist" == true || "$loaded" == true ]]; then
+        echo "  - Scheduled job: ${plist}$([[ "$loaded" == true ]] && echo " (loaded in launchd)")"
+    fi
+    case "$kind" in
+        copy)    echo "  - Program: ${program}" ;;
+        link)    echo "  - Program: ${program} (a link to $(readlink "$program"); only the link is removed, never the file it points to)" ;;
+        foreign) print_warning "${program} is not a CheckSSR script, so it will be left alone" ;;
+    esac
+    if [[ ${#data_dirs[@]} -gt 0 ]]; then
+        echo
+        echo "Your data (kept unless you choose to delete it):"
+        for d in "${data_dirs[@]}"; do
+            echo "  - ${d}: $(ls -A "$d" | head -n 6 | tr '\n' ' ')"
+        done
+    fi
+    if [[ ${#leftovers[@]} -gt 0 ]]; then
+        echo
+        echo "Leftover temporary files from an earlier install (will be removed): ${leftovers[*]}"
+    fi
+    echo
+
+    # --- Ask ----------------------------------------------------------------------
+    if [[ "$ASSUME_YES" == false ]]; then
+        if ! ask_yes_no "Remove the scheduled job and the program?"; then
+            print_info "Nothing was removed."
+            return 0
+        fi
+    fi
+    local delete_data=false
+    if [[ ${#data_dirs[@]} -gt 0 ]]; then
+        if [[ "$PURGE" == true ]]; then
+            delete_data=true
+        elif [[ "$ASSUME_YES" == false ]]; then
+            echo
+            echo "Also delete your settings (including your email address), your positions list and the logs?"
+            if ask_yes_no "Delete them? (n keeps them)"; then delete_data=true; fi
+        fi
+    fi
+    echo
+
+    # --- Remove ---------------------------------------------------------------------
+    # 1. The scheduled job: unload it first, with fallbacks, then delete its file
+    if [[ "$have_plist" == true || "$loaded" == true ]]; then
+        if command -v launchctl &> /dev/null; then
+            if [[ "$have_plist" == true ]]; then launchctl unload "$plist" > /dev/null 2>&1 || true; fi
+            if job_is_loaded; then launchctl bootout "gui/$(id -u)/com.user.checkssr" > /dev/null 2>&1 || true; fi
+            if job_is_loaded; then launchctl remove com.user.checkssr > /dev/null 2>&1 || true; fi
+        fi
+        if [[ "$have_plist" == true ]]; then rm -f "$plist" || true; fi
+        if job_is_loaded; then
+            failed+=("The scheduled job is still loaded. Stop it with: launchctl remove com.user.checkssr")
+        elif [[ -e "$plist" ]]; then
+            failed+=("Could not delete ${plist}")
+        else
+            removed+=("Scheduled job (stopped and deleted)")
+        fi
+    fi
+
+    # 2. The program
+    case "$kind" in
+        copy|link)
+            rm -f "$program" || true
+            if [[ -e "$program" || -L "$program" ]]; then
+                failed+=("Could not delete ${program}")
+            else
+                removed+=("Program ${program}")
+            fi
+            ;;
+        foreign) kept+=("${program} (not a CheckSSR script, left alone)") ;;
+    esac
+
+    # 3. Leftover installer temporary folders
+    for d in ${leftovers[@]+"${leftovers[@]}"}; do
+        rm -rf "$d" || true
+        if [[ -e "$d" ]]; then failed+=("Could not delete ${d}"); else removed+=("Temporary folder ${d}"); fi
+    done
+
+    # 4. Your data, only if you chose to
+    for d in ${data_dirs[@]+"${data_dirs[@]}"}; do
+        if [[ "$delete_data" == true ]]; then
+            remove_known_files "$d"
+            rmdir "$d" 2> /dev/null || true
+            if [[ -d "$d" ]]; then
+                kept+=("${d} (contains other files, so the folder itself was left; CheckSSR's own files in it were deleted)")
+            else
+                removed+=("${d}")
+            fi
+        else
+            kept+=("${d}")
+        fi
+    done
+
+    # --- Report -----------------------------------------------------------------------
+    echo "Result:"
+    for d in ${removed[@]+"${removed[@]}"}; do print_success "Removed: ${d}"; done
+    for d in ${kept[@]+"${kept[@]}"}; do print_info "Kept: ${d}"; done
+    for d in ${failed[@]+"${failed[@]}"}; do print_warning "${d}"; done
+    echo
+    if command -v launchctl &> /dev/null; then
+        if job_is_loaded; then
+            print_warning "A scheduled job named com.user.checkssr is still loaded."
+        else
+            print_success "Verified: no scheduled job named com.user.checkssr is loaded, so nothing will run again."
+        fi
+    fi
+    echo
+    echo "Not touched, because this installer did not create them:"
+    echo "  - Email delivery settings: ~/.msmtprc and any Keychain password you added for it"
+    echo "  - Programs installed with a package manager (msmtp, Python)"
+    echo "  - The ~/bin folder itself, and this download folder (delete it yourself if you like)"
+    echo
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        return 1
+    fi
+    echo "CheckSSR has been uninstalled."
 }
 
 # Main execution
@@ -612,6 +831,29 @@ main() {
     print_usage_instructions
 }
 
-# Run the main function
-main
+# Options: no option installs; --uninstall removes
+MODE="install"
+PURGE=false
+ASSUME_YES=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --uninstall) MODE="uninstall" ;;
+        --purge)     PURGE=true ;;
+        -y|--yes)    ASSUME_YES=true ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+if [[ "$MODE" != "uninstall" && ( "$PURGE" == true || "$ASSUME_YES" == true ) ]]; then
+    echo "--purge and --yes only work together with --uninstall." >&2
+    exit 2
+fi
+
+# Run the requested action
+if [[ "$MODE" == "uninstall" ]]; then
+    uninstall
+else
+    main
+fi
 
