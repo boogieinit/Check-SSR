@@ -69,7 +69,8 @@ LOG_FILE="${LOG_DIR}/checkssr_$(date +%Y%m%d).log"
 mkdir -p "${LOG_DIR}"
 
 # Remember where this run's lines start in the log (used in the failure email)
-RUN_LOG_START=$(wc -l < "${LOG_FILE}" 2>/dev/null || echo 0)
+touch "${LOG_FILE}"
+RUN_LOG_START=$(wc -l < "${LOG_FILE}")
 FAILURE_MAILED=0
 
 # Function to log messages: to the log file and the screen. With --print the report goes to
