@@ -72,11 +72,19 @@ mkdir -p "${LOG_DIR}"
 RUN_LOG_START=$(wc -l < "${LOG_FILE}" 2>/dev/null || echo 0)
 FAILURE_MAILED=0
 
-# Function to log messages (to the screen on stderr, and to the log file)
+# Function to log messages: to the log file and the screen. With --print the report goes to
+# stdout, so log lines go to stderr then; otherwise they go to stdout (launchd keeps its
+# "error" log for real errors only).
 log() {
     local level="$1"
     local message="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] ${message}" | tee -a "${LOG_FILE}" >&2
+    local line
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] ${message}"
+    if [[ "${PRINT_ONLY}" -eq 1 ]]; then
+        echo "${line}" | tee -a "${LOG_FILE}" >&2
+    else
+        echo "${line}" | tee -a "${LOG_FILE}"
+    fi
 }
 
 usage() {
