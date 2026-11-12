@@ -93,86 +93,79 @@ print_info() {
 
 # Setup error handling and signal trapping
 setup_error_handling() {
-    # Create temporary directory for rollback files
+    # Temporary folder for the backups that rollback needs (removed again at the end)
     TEMP_DIR=$(mktemp -d "${HOME}/.checkssr_installer_temp.XXXXXX") || {
         echo -e "${RED}✗ ERROR: Failed to create temporary directory${NC}" >&2
         exit 1
     }
-    
-    # Trap exit signals to ensure cleanup
+
+    # -E makes the ERR trap work inside functions too, so any unexpected failure (not only the
+    # ones reported through print_error) is rolled back
+    set -E
+
+    # Roll back if the installer fails or is interrupted (Ctrl-C, terminal closed, kill)
     trap 'cleanup_and_exit 1' SIGHUP SIGINT SIGTERM ERR
-    
-    print_success "Error handling and signal trapping set up"
 }
 
-# Cleanup function for error handling
+# Undo what this run did if it failed, and always remove the temporary folder
 cleanup_and_exit() {
     local exit_code=$1
-    
+    local i action
+
+    # Stop the traps firing again while cleaning up, and keep going past any error
+    trap - SIGHUP SIGINT SIGTERM ERR
+    set +e
+
     if [[ "${exit_code}" -ne 0 ]]; then
         echo -e "${RED}Installation failed. Rolling back changes...${NC}" >&2
-        
-        # Roll back actions in reverse order
+
+        # Undo the actions in reverse order
         for ((i=${#ACTIONS_PERFORMED[@]}-1; i>=0; i--)); do
-            local action="${ACTIONS_PERFORMED[$i]}"
+            action="${ACTIONS_PERFORMED[$i]}"
             case "${action}" in
                 "installed_script")
                     echo "Rolling back script installation..."
                     if [[ -f "${TEMP_DIR}/checkssr.bak" ]]; then
-                        if [[ -f "${INSTALL_BIN_DIR}/checkssr" ]]; then
-                            mv "${TEMP_DIR}/checkssr.bak" "${INSTALL_BIN_DIR}/checkssr" 2>/dev/null || true
-                        fi
-                    elif [[ -f "${INSTALL_BIN_DIR}/checkssr" ]]; then
-                        rm -f "${INSTALL_BIN_DIR}/checkssr" 2>/dev/null || true
+                        mv -f "${TEMP_DIR}/checkssr.bak" "${INSTALL_BIN_DIR}/checkssr"    # put the old one back
+                    else
+                        rm -f "${INSTALL_BIN_DIR}/checkssr"
                     fi
                     ;;
                 "created_config")
                     echo "Rolling back configuration..."
-                    if [[ -f "${TEMP_DIR}/config.sh.bak" ]]; then
-                        if [[ -f "${CONFIG_DIR}/config.sh" ]]; then
-                            mv "${TEMP_DIR}/config.sh.bak" "${CONFIG_DIR}/config.sh" 2>/dev/null || true
-                        fi
-                    elif [[ -f "${CONFIG_DIR}/config.sh" ]] && [[ ! -s "${CONFIG_DIR}/config.sh" ]]; then
-                        rm -f "${CONFIG_DIR}/config.sh" 2>/dev/null || true
-                    fi
+                    rm -f "${CONFIG_DIR}/config.sh"
                     ;;
                 "created_positions")
                     echo "Rolling back positions file..."
-                    if [[ -f "${TEMP_DIR}/positions.txt.bak" ]]; then
-                        if [[ -f "${DATA_DIR}/positions.txt" ]]; then
-                            mv "${TEMP_DIR}/positions.txt.bak" "${DATA_DIR}/positions.txt" 2>/dev/null || true
-                        fi
-                    elif [[ -f "${DATA_DIR}/positions.txt" ]] && [[ ! -s "${DATA_DIR}/positions.txt" ]]; then
-                        rm -f "${DATA_DIR}/positions.txt" 2>/dev/null || true
-                    fi
+                    rm -f "${DATA_DIR}/positions.txt"
                     ;;
                 "created_launchd")
                     echo "Rolling back launchd configuration..."
-                    launchctl unload "${LAUNCHD_DIR}/${LAUNCHD_FILE}" 2>/dev/null || true
+                    launchctl unload "${LAUNCHD_DIR}/${LAUNCHD_FILE}" > /dev/null 2>&1
                     if [[ -f "${TEMP_DIR}/checkssr.plist.bak" ]]; then
-                        if [[ -f "${LAUNCHD_DIR}/${LAUNCHD_FILE}" ]]; then
-                            mv "${TEMP_DIR}/checkssr.plist.bak" "${LAUNCHD_DIR}/${LAUNCHD_FILE}" 2>/dev/null || true
-                        fi
-                    elif [[ -f "${LAUNCHD_DIR}/${LAUNCHD_FILE}" ]]; then
-                        rm -f "${LAUNCHD_DIR}/${LAUNCHD_FILE}" 2>/dev/null || true
+                        # put the previous schedule back, and start it again
+                        mv -f "${TEMP_DIR}/checkssr.plist.bak" "${LAUNCHD_DIR}/${LAUNCHD_FILE}"
+                        launchctl load "${LAUNCHD_DIR}/${LAUNCHD_FILE}" > /dev/null 2>&1
+                    else
+                        rm -f "${LAUNCHD_DIR}/${LAUNCHD_FILE}"
                     fi
+                    ;;
+                created_dir:*)
+                    rmdir "${action#created_dir:}" 2> /dev/null     # only succeeds if it is empty again
                     ;;
             esac
         done
     fi
-    
-    # Always cleanup temporary directory
-    if [[ -d "${TEMP_DIR}" ]]; then
-        rm -rf "${TEMP_DIR}" 2>/dev/null || true
+
+    # Always remove the temporary folder
+    if [[ -n "${TEMP_DIR}" && "${TEMP_DIR}" == "${HOME}/.checkssr_installer_temp."* && -d "${TEMP_DIR}" ]]; then
+        rm -rf "${TEMP_DIR}"
     fi
-    
-    # Remove trap
-    trap - SIGHUP SIGINT SIGTERM ERR
-    
+
     if [[ "${exit_code}" -ne 0 ]]; then
         echo -e "${RED}Installation aborted.${NC}" >&2
     fi
-    
+
     exit "${exit_code}"
 }
 
@@ -282,15 +275,29 @@ check_requirements() {
 }
 
 # Create necessary directories with proper permissions
+# Record every folder that does not exist yet and is about to be created, including missing
+# parent folders (mkdir -p makes those too), so a rollback removes exactly those again.
+# Parents are recorded first, so the rollback (which runs in reverse) removes the leaf first.
+record_new_dirs() {
+    local d="$1" missing=()
+    while [[ ! -d "$d" && "$d" != "/" && "$d" != "." ]]; do
+        missing=("$d" ${missing[@]+"${missing[@]}"})
+        d="$(dirname "$d")"
+    done
+    for d in ${missing[@]+"${missing[@]}"}; do
+        ACTIONS_PERFORMED+=("created_dir:${d}")
+    done
+}
+
 create_directories() {
     echo "Creating required directories..."
     
     # Create bin directory if it doesn't exist
     if [[ ! -d "${INSTALL_BIN_DIR}" ]]; then
+        record_new_dirs "${INSTALL_BIN_DIR}"
         mkdir -p "${INSTALL_BIN_DIR}" || print_error "Failed to create bin directory ${INSTALL_BIN_DIR}"
         chmod 755 "${INSTALL_BIN_DIR}" || print_warning "Failed to set permissions on ${INSTALL_BIN_DIR}"
         print_success "Created bin directory at ${INSTALL_BIN_DIR}"
-        ACTIONS_PERFORMED+=("created_bin_dir")
     else
         if ! validate_path "${INSTALL_BIN_DIR}" "dir" "true"; then
             print_error "Cannot write to bin directory ${INSTALL_BIN_DIR}"
@@ -300,10 +307,10 @@ create_directories() {
     
     # Create config directory if it doesn't exist
     if [[ ! -d "${CONFIG_DIR}" ]]; then
+        record_new_dirs "${CONFIG_DIR}"
         mkdir -p "${CONFIG_DIR}" || print_error "Failed to create config directory ${CONFIG_DIR}"
         chmod 700 "${CONFIG_DIR}" || print_warning "Failed to set permissions on ${CONFIG_DIR}"
         print_success "Created config directory at ${CONFIG_DIR}"
-        ACTIONS_PERFORMED+=("created_config_dir")
     else
         if ! validate_path "${CONFIG_DIR}" "dir" "true"; then
             print_error "Cannot write to config directory ${CONFIG_DIR}"
@@ -313,10 +320,10 @@ create_directories() {
     
     # Create data directory if it doesn't exist
     if [[ ! -d "${DATA_DIR}" ]]; then
+        record_new_dirs "${DATA_DIR}"
         mkdir -p "${DATA_DIR}" || print_error "Failed to create data directory ${DATA_DIR}"
         chmod 755 "${DATA_DIR}" || print_warning "Failed to set permissions on ${DATA_DIR}"
         print_success "Created data directory at ${DATA_DIR}"
-        ACTIONS_PERFORMED+=("created_data_dir")
     else
         if ! validate_path "${DATA_DIR}" "dir" "true"; then
             print_error "Cannot write to data directory ${DATA_DIR}"
@@ -326,10 +333,10 @@ create_directories() {
     
     # Create log directory if it doesn't exist
     if [[ ! -d "${LOG_DIR}" ]]; then
+        record_new_dirs "${LOG_DIR}"
         mkdir -p "${LOG_DIR}" || print_error "Failed to create log directory ${LOG_DIR}"
         chmod 755 "${LOG_DIR}" || print_warning "Failed to set permissions on ${LOG_DIR}"
         print_success "Created log directory at ${LOG_DIR}"
-        ACTIONS_PERFORMED+=("created_log_dir")
     else
         if ! validate_path "${LOG_DIR}" "dir" "true"; then
             print_error "Cannot write to log directory ${LOG_DIR}"
@@ -359,10 +366,11 @@ install_script() {
     
     # Backup existing script if it exists
     if [[ -f "${INSTALL_BIN_DIR}/checkssr" ]]; then
-        cp "${INSTALL_BIN_DIR}/checkssr" "${TEMP_DIR}/checkssr.bak" || print_warning "Failed to backup existing script"
+        cp -p "${INSTALL_BIN_DIR}/checkssr" "${TEMP_DIR}/checkssr.bak" || print_warning "Failed to backup existing script"
     fi
     
     # Copy script to bin directory
+    ACTIONS_PERFORMED+=("installed_script")    # recorded first, so a half-finished copy is rolled back too
     cp "${SOURCE_SCRIPT}" "${INSTALL_BIN_DIR}/checkssr" || print_error "Failed to copy script to ${INSTALL_BIN_DIR}/checkssr"
     chmod +x "${INSTALL_BIN_DIR}/checkssr" || print_warning "Failed to make script executable"
     
@@ -371,7 +379,6 @@ install_script() {
         print_error "Script installation failed - file not found at ${INSTALL_BIN_DIR}/checkssr"
     fi
     
-    ACTIONS_PERFORMED+=("installed_script")
     print_success "Installed CheckSSR script to ${INSTALL_BIN_DIR}/checkssr"
 }
 
@@ -386,6 +393,7 @@ create_config() {
     
     # Create default config if it doesn't exist
     if [[ ! -f "${CONFIG_DIR}/config.sh" ]]; then
+        ACTIONS_PERFORMED+=("created_config")    # recorded first, so a half-written file is rolled back too
         cat > "${CONFIG_DIR}/config.sh" << EOL || print_error "Failed to create configuration file"
 # CheckSSR Configuration File
 # Generated by installer on $(date)
@@ -403,7 +411,6 @@ MARKETS="NASDAQ NYSE"
 TOPN=10
 EOL
         chmod 600 "${CONFIG_DIR}/config.sh" || print_warning "Failed to set secure permissions on config file"
-        ACTIONS_PERFORMED+=("created_config")
         print_success "Created default configuration at ${CONFIG_DIR}/config.sh"
         print_warning "Please edit ${CONFIG_DIR}/config.sh to set your email address!"
     else
@@ -422,6 +429,7 @@ create_positions_file() {
     
     # Create sample positions file if it doesn't exist
     if [[ ! -f "${DATA_DIR}/positions.txt" ]]; then
+        ACTIONS_PERFORMED+=("created_positions")    # recorded first, so a half-written file is rolled back too
         cat > "${DATA_DIR}/positions.txt" << EOL || print_error "Failed to create positions file"
 # CheckSSR Positions File
 # Add one ticker symbol per line (lines starting with # are ignored).
@@ -440,7 +448,6 @@ create_positions_file() {
 # BRK.B
 EOL
         chmod 644 "${DATA_DIR}/positions.txt" || print_warning "Failed to set permissions on positions file"
-        ACTIONS_PERFORMED+=("created_positions")
         print_success "Created sample positions file at ${DATA_DIR}/positions.txt"
         print_warning "Please edit ${DATA_DIR}/positions.txt to add your stock positions!"
     else
@@ -468,18 +475,22 @@ setup_scheduled_execution() {
         
         # Backup existing launchd file if it exists
         if [[ -f "${LAUNCHD_DIR}/${LAUNCHD_FILE}" ]]; then
-            cp "${LAUNCHD_DIR}/${LAUNCHD_FILE}" "${TEMP_DIR}/checkssr.plist.bak" || print_warning "Failed to backup existing launchd file"
+            cp -p "${LAUNCHD_DIR}/${LAUNCHD_FILE}" "${TEMP_DIR}/checkssr.plist.bak" || print_warning "Failed to backup existing launchd file"
             # Try to unload existing service first
             launchctl unload "${LAUNCHD_DIR}/${LAUNCHD_FILE}" 2>/dev/null || true
         fi
         
         # Create LaunchAgents directory if it doesn't exist
         if [[ ! -d "${LAUNCHD_DIR}" ]]; then
+            record_new_dirs "${LAUNCHD_DIR}"
             mkdir -p "${LAUNCHD_DIR}" || print_error "Failed to create LaunchAgents directory"
             chmod 755 "${LAUNCHD_DIR}" || print_warning "Failed to set permissions on LaunchAgents directory"
         fi
         
         # Create launchd plist
+        # Recorded before the file is written (and before the job is loaded), so a failure at any
+        # point puts the previous schedule back, or removes the new one
+        ACTIONS_PERFORMED+=("created_launchd")
         cat > "${LAUNCHD_DIR}/${LAUNCHD_FILE}" << EOL || print_error "Failed to create launchd plist file"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -552,7 +563,6 @@ EOL
             print_warning "Failed to load launchd job. You may need to load it manually with:"
             print_info "launchctl load ${LAUNCHD_DIR}/${LAUNCHD_FILE}"
         else
-            ACTIONS_PERFORMED+=("created_launchd")
             print_success "Scheduled CheckSSR to run at 8:40am on weekdays"
             print_info "The schedule was added through launchd at ${LAUNCHD_DIR}/${LAUNCHD_FILE}"
         fi
@@ -822,6 +832,7 @@ uninstall() {
 # Main execution
 main() {
     print_banner
+    setup_error_handling
     check_requirements
     create_directories
     install_script
@@ -829,6 +840,7 @@ main() {
     create_positions_file
     setup_scheduled_execution
     print_usage_instructions
+    cleanup_and_exit 0    # success: remove the temporary folder
 }
 
 # Options: no option installs; --uninstall removes
