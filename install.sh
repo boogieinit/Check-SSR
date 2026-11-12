@@ -340,6 +340,21 @@ create_directories() {
 # Install script
 install_script() {
     echo "Installing CheckSSR script..."
+
+    # If checkssr is already a symbolic link (for example, linked from a git checkout so edits
+    # take effect right away), leave it alone: copying over it would fail or overwrite the repo file.
+    if [[ -L "${INSTALL_BIN_DIR}/checkssr" ]]; then
+        if [[ "${INSTALL_BIN_DIR}/checkssr" -ef "${SOURCE_SCRIPT}" ]]; then
+            print_info "${INSTALL_BIN_DIR}/checkssr is already a link to this script. Skipping the copy."
+        elif [[ -e "${INSTALL_BIN_DIR}/checkssr" ]]; then
+            print_warning "${INSTALL_BIN_DIR}/checkssr is a link to a different file ($(readlink "${INSTALL_BIN_DIR}/checkssr")). Skipping the copy."
+            print_info "To install a copy instead, remove that link and run this installer again."
+        else
+            print_warning "${INSTALL_BIN_DIR}/checkssr is a broken link (its target is missing). Skipping the copy."
+            print_info "To fix it, remove the link and run this installer again, or point it at ${SOURCE_SCRIPT}."
+        fi
+        return 0
+    fi
     
     # Backup existing script if it exists
     if [[ -f "${INSTALL_BIN_DIR}/checkssr" ]]; then
